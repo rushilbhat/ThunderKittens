@@ -8,9 +8,15 @@ template<int M_BLOCK, int N_BLOCK>
 struct matmul_layout {
     using  base_tile      = st_bf<64, 64>;
     using  global_layout  = gl<bf16, 1, 1, -1, -1, base_tile>;
-    struct globals        { global_layout A, B, C; };
+    using  bias_vec       = sv_bf<64*N_BLOCK>;
+    using  bias_layout    = gl<bf16, 1, 1, 1, -1, bias_vec>;
+    struct globals        { 
+        global_layout A, B, C; 
+        bias_layout   bias;
+    };
     struct input_block    { base_tile a[M_BLOCK], b[N_BLOCK]; };
     struct finish_block   { base_tile c[M_BLOCK][N_BLOCK]; };
+    struct scratch_block  { bias_vec bias; };
     struct common_state   { int2 coord; };
     struct consumer_state { rt_fl<16, 64> accum[N_BLOCK]; };
 };
@@ -66,6 +72,22 @@ struct matmul_template {
             warpgroup::increase_registers<232>(); // increase registers for consumers
             for (int n = 0; n < N_BLOCK; n++) 
                 zero(args.state.accum[n]);
+            // Every consumer warp in the CTA needs the same 256-element bias slice, so we have all eight consumer warps cooperate on that single load. 
+            // group<NUM_CONSUMER_WARPS>::load just divides the slice into equal chunks: each thread gets its own subset of elements to copy into registers then shared memory 
+            // (done under the hood with ld.global and st.shard).
+
+            // Since args.scratch.bias is type sv_bf<64*N_BLOCK>, the coord passed as the third arg to load (i.e. starting idx of the load) must be coord<sv_bf<64*N_BLOCK>>.
+            // Thus, we want the starting index of the slice into the bias to be in terms of tasks (i.e. width 256), which is why we divide by N_BLOCK.
+            // [See defition of .unit_coord<-1, 3>() to get more clarity if confused]
+
+            // To clarify why the slice of the bias vector is being loaded collaboratively into shared memory instead of each warp issuing the load for the entire slice in the epilogue:
+            // If each warp just does its own global load in the epilogue, all eight warps load the same 256 bias values independently - identical work and unnecessary bandwidth.
+            // Even if you tried to split the load warps cooperatively (each warp loads a subset into its registers), you’d still need a way for every warp to access all 256 entries
+            // (remember registers are private to a thread).
+            // By loading once into shared memory, we're doing a single global transfer, and then each warp grabs what it needs in the epilogue.
+            int start_idx = args.common.coord.y / N_BLOCK;
+            group<NUM_CONSUMER_WARPS>::load(args.scratch.bias, args.globals.bias, {start_idx});
+            group<NUM_CONSUMER_WARPS>::sync(0);
         }
         __device__ static void compute(consumer_compute_args<layout> args) {
             using wide_rt = rt_fl<16, 64*N_BLOCK>;
@@ -81,6 +103,12 @@ struct matmul_template {
         }
         __device__ static void finish(consumer_finish_args<layout> args) {
             for(int n = 0; n < N_BLOCK; n++) {
+                // Logically carve out 64-scalar chunk, load into register vector, perform broadcasted-sum.
+                auto &bias_sv = subvec_inplace<64>(args.scratch.bias, n);
+                rt_fl<16, 64>::row_vec bias_rv;
+                load(bias_rv, bias_sv);
+                col_map<base_ops::sum>(args.state.accum[n], args.state.accum[n], bias_rv);
+                // Apply ReLU activation
                 relu(args.state.accum[n], args.state.accum[n]);
                 warpgroup::store(args.finish.c[warpgroup::groupid()][n], args.state.accum[n]);
             }
@@ -110,7 +138,7 @@ constexpr bool NCU = false;
 #include <cuda_bf16.h>
 #include <omp.h>
 
-void cpu_gemm(float* a, float* b, float* c, int M, int N, int K) {
+void cpu_gemm_with_bias(float* a, float* b, float* bias, float* c, int M, int N, int K) {
     #pragma omp parallel for collapse(2) // otherwise the CPU version takes for everrrrrr
     for (int i = 0; i < M; i++) {
         for (int j = 0; j < N; j++) {
@@ -119,20 +147,23 @@ void cpu_gemm(float* a, float* b, float* c, int M, int N, int K) {
                 sum += a[i * K + k] * b[j * K + k];
                 // sum += a[i * K + k] * b[k * N + j];
             }
-            c[i * N + j] = std::max(sum, 0.0f);
+            float result = sum + bias[j];
+            c[i * N + j] = std::max(result, 0.0f);
         }
     }
 }
 
 template<typename mmt>
-void inner_run(bf16 *d_A, bf16 *d_B, bf16 *d_C, size_t M, size_t N, size_t K, dim3 grid, dim3 block) {
+void inner_run(bf16 *d_A, bf16 *d_B, bf16 *d_C, bf16 *d_bias, size_t M, size_t N, size_t K, dim3 grid, dim3 block) {
     using global_layout = typename mmt::layout::global_layout;
+    using bias_layout   = typename mmt::layout::bias_layout;
     using globals  = typename mmt::layout::globals;
     // printf("M: %d, N: %d, K: %d\n", M, N, K);
     global_layout Ag{d_A, nullptr, nullptr, M, K};
     global_layout Bg{d_B, nullptr, nullptr, N, K};
     global_layout Cg{d_C, nullptr, nullptr, M, N};
-    globals G{Ag, Bg, Cg};
+    bias_layout   biasg{d_bias, nullptr, nullptr, nullptr, N};
+    globals G{Ag, Bg, Cg, biasg};
     prototype::lcf::kernel<mmt><<<grid, block, MAX_SHARED_MEMORY-1024>>>(G);
 }
 
@@ -148,6 +179,7 @@ int run_benchmark(size_t M, size_t N, size_t K) {
     float *h_B = new float[K * N];
     float *h_C = new float[M * N];
     float *h_C_ref = new float[M * N];
+    float *h_bias = new float[N];
 
     std::cout << "Allocated host memory" << std::endl;
 
@@ -159,19 +191,21 @@ int run_benchmark(size_t M, size_t N, size_t K) {
     // Initialize matrices with random values
     for (int i = 0; i < M * K; ++i) h_A[i] = dis(gen);
     for (int i = 0; i < K * N; ++i) h_B[i] = dis(gen);
+    for (int i=0; i < N; ++i) h_bias[i] = dis(gen);
 
     std::cout << "Initialized matrices" << std::endl;
 
     // Perform CPU matrix multiplication for reference
-    if(true) cpu_gemm(h_A, h_B, h_C_ref, M, N, K);
+    if(true) cpu_gemm_with_bias(h_A, h_B, h_bias, h_C_ref,  M, N, K);
 
     std::cout << "Performed CPU matrix multiplication" << std::endl;
 
     // Allocate device memory
-    __nv_bfloat16 *d_A, *d_B, *d_C;
+    __nv_bfloat16 *d_A, *d_B, *d_C, *d_bias;
     cudaMalloc(&d_A, M*K*sizeof(__nv_bfloat16));
     cudaMalloc(&d_B, K*N*sizeof(__nv_bfloat16));
     cudaMalloc(&d_C, M*N*sizeof(__nv_bfloat16));
+    cudaMalloc(&d_bias, N*sizeof(__nv_bfloat16));
 
     // Check for CUDA errors
     cudaStatus = cudaGetLastError();
@@ -186,11 +220,14 @@ int run_benchmark(size_t M, size_t N, size_t K) {
     // Convert to __nv_bfloat16 and copy to device
     __nv_bfloat16 *h_A_bf16 = new __nv_bfloat16[M * K];
     __nv_bfloat16 *h_B_bf16 = new __nv_bfloat16[K * N];
+    __nv_bfloat16 *h_bias_bf16 = new __nv_bfloat16[N];
     for (int i = 0; i < M * K; ++i) h_A_bf16[i] = __float2bfloat16(h_A[i]);
     for (int i = 0; i < K * N; ++i) h_B_bf16[i] = __float2bfloat16(h_B[i]);
+    for (int i = 0; i < N; ++i) h_bias_bf16[i] = __float2bfloat16(h_bias[i]);
 
     cudaMemcpy(d_A, h_A_bf16, M*K*2, cudaMemcpyHostToDevice);
     cudaMemcpy(d_B, h_B_bf16, K*N*2, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_bias, h_bias_bf16, N, cudaMemcpyHostToDevice);
 
     std::cout << "Copied matrices to device" << std::endl;
 
@@ -202,7 +239,7 @@ int run_benchmark(size_t M, size_t N, size_t K) {
     dim3 block(kittens::prototype::detail::NUM_THREADS_v<mmt>);
     std::cout << "Launching warmup kernel with grid (" << grid.x << ", " << grid.y << "), block (" << block.x << ")\n";
     for(int i = 0; i < (NCU ? 0 : 2); i++) { // warmup
-        inner_run<mmt>(d_A, d_B, d_C, M, N, K, grid, block);
+        inner_run<mmt>(d_A, d_B, d_C, d_bias, M, N, K, grid, block);
     }
 
     // Start timing
@@ -212,7 +249,7 @@ int run_benchmark(size_t M, size_t N, size_t K) {
 
     constexpr int ITERS = (NCU ? 1 : 10);
     for(int i = 0; i < ITERS; i++) {
-        inner_run<mmt>(d_A, d_B, d_C, M, N, K, grid, block);
+        inner_run<mmt>(d_A, d_B, d_C, d_bias, M, N, K, grid, block);
     }
     cudaDeviceSynchronize();
 
@@ -266,17 +303,24 @@ int run_benchmark(size_t M, size_t N, size_t K) {
     std::cout << "Max error: " << max_error << std::endl;
     std::cout << "Error count: " << error_count << std::endl;
 
+    // for (int i=0; i < 100; ++i) {
+    //     std::cout << h_C[i] << ", " << h_C_ref[i] << std::endl;
+    // }
+
     // Clean up
     delete[] h_A;
     delete[] h_B;
     delete[] h_C;
     delete[] h_C_ref;
+    delete[] h_bias;
     delete[] h_A_bf16;
     delete[] h_B_bf16;
     delete[] h_C_bf16;
+    delete[] h_bias_bf16;
     cudaFree(d_A);
     cudaFree(d_B);
     cudaFree(d_C);
+    cudaFree(d_bias);
 
     return 0;
 }
